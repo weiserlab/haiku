@@ -1,3 +1,12 @@
+## Operating System for More Capable Embedded and IoT Device
+
+Details to be added (TBA)
+
+Built on Fork of Haiku!
+
+
+## Readme from Haiku
+
 Haiku
 =======================
 **[Homepage](https://www.haiku-os.org/)
