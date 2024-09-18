@@ -130,6 +130,26 @@ set_mtrrs()
 static bool
 add_used_mtrr(uint64 base, uint64 size, uint32 type)
 {
+	switch (type) {
+		case B_MTR_UC:
+			type = IA32_MTR_UNCACHED;
+			break;
+		case B_MTR_WC:
+			type = IA32_MTR_WRITE_COMBINING;
+			break;
+		case B_MTR_WT:
+			type = IA32_MTR_WRITE_THROUGH;
+			break;
+		case B_MTR_WP:
+			type = IA32_MTR_WRITE_PROTECTED;
+			break;
+		case B_MTR_WB:
+			type = IA32_MTR_WRITE_BACK;
+			break;
+		default:
+			return false;
+	}
+
 	if (sMemoryTypeRegistersUsed == sMemoryTypeRegisterCount)
 		return false;
 
@@ -308,7 +328,7 @@ ensure_temporary_ranges_space(int32 count)
 }
 
 
-status_t
+static status_t
 update_mtrrs(update_mtrr_info& updateInfo)
 {
 	// resize the temporary points/ranges arrays, if necessary
@@ -320,7 +340,7 @@ update_mtrrs(update_mtrr_info& updateInfo)
 	int32 pointCount = 0;
 	for (MemoryTypeRangeList::Iterator it = sMemoryTypeRanges.GetIterator();
 			memory_type_range* range = it.Next();) {
-		if (range->type == IA32_MTR_UNCACHED) {
+		if (range->type == B_MTR_UC) {
 			// Ignore uncacheable ranges below a certain size, if requested.
 			// Since we always enforce uncacheability via the PTE attributes,
 			// this is no problem (though not recommended for performance
@@ -437,11 +457,11 @@ update_mtrrs(update_mtrr_info& updateInfo)
 		rangeList.Add(&ranges[i]);
 
 	static const uint32 kMemoryTypes[] = {
-		IA32_MTR_UNCACHED,
-		IA32_MTR_WRITE_COMBINING,
-		IA32_MTR_WRITE_PROTECTED,
-		IA32_MTR_WRITE_THROUGH,
-		IA32_MTR_WRITE_BACK
+		B_MTR_UC,
+		B_MTR_WC,
+		B_MTR_WP,
+		B_MTR_WT,
+		B_MTR_WB
 	};
 	static const int32 kMemoryTypeCount = sizeof(kMemoryTypes)
 		/ sizeof(*kMemoryTypes);
@@ -452,8 +472,7 @@ update_mtrrs(update_mtrr_info& updateInfo)
 		// Remove uncached and write-through ranges after processing them. This
 		// let's us leverage their intersection property with any other
 		// respectively write-back ranges.
-		bool removeRanges = type == IA32_MTR_UNCACHED
-			|| type == IA32_MTR_WRITE_THROUGH;
+		bool removeRanges = type == B_MTR_UC || type == B_MTR_WT;
 
 		optimize_memory_ranges(rangeList, type, removeRanges);
 	}
@@ -475,7 +494,7 @@ update_mtrrs(update_mtrr_info& updateInfo)
 		uint32 type = kMemoryTypes[i];
 
 		// skip write-back ranges -- that'll be the default type anyway
-		if (type == IA32_MTR_WRITE_BACK)
+		if (type == B_MTR_WB)
 			continue;
 
 		for (int32 i = 0; i < rangeCount; i++) {
@@ -493,7 +512,7 @@ update_mtrrs(update_mtrr_info& updateInfo)
 }
 
 
-status_t
+static status_t
 update_mtrrs()
 {
 	// Until we know how many MTRRs we have, pretend everything is OK.
@@ -535,36 +554,44 @@ update_mtrrs()
 
 
 static status_t
-add_memory_type_range(area_id areaID, uint64 base, uint64 size, uint32 type)
+add_memory_type_range(area_id areaID, uint64 base, uint64 size, uint32 type,
+	uint32 *effectiveType)
 {
-	// translate the type
 	if (type == 0)
 		return B_OK;
-
-	switch (type) {
-		case B_MTR_UC:
-			type = IA32_MTR_UNCACHED;
-			break;
-		case B_MTR_WC:
-			type = IA32_MTR_WRITE_COMBINING;
-			break;
-		case B_MTR_WT:
-			type = IA32_MTR_WRITE_THROUGH;
-			break;
-		case B_MTR_WP:
-			type = IA32_MTR_WRITE_PROTECTED;
-			break;
-		case B_MTR_WB:
-			type = IA32_MTR_WRITE_BACK;
-			break;
-		default:
-			return B_BAD_VALUE;
-	}
 
 	TRACE_MTRR2("add_memory_type_range(%" B_PRId32 ", %#" B_PRIx64 ", %#"
 		B_PRIx64 ", %" B_PRIu32 ")\n", areaID, base, size, type);
 
 	MutexLocker locker(sMemoryTypeLock);
+
+	for (MemoryTypeRangeList::Iterator it = sMemoryTypeRanges.GetIterator();
+			memory_type_range* range = it.Next(); ) {
+
+		if (range->area == areaID || range->type == type
+				|| base + size <= range->base
+				|| base >= range->base + range->size) {
+			continue;
+		}
+
+		if (effectiveType != NULL) {
+			type = *effectiveType = range->type;
+			effectiveType = NULL;
+
+			dprintf("assuming memory type %" B_PRIx32 " for overlapping %#"
+				B_PRIx64 ", %#" B_PRIx64 " area %" B_PRId32 " from existing %#"
+				B_PRIx64 ", %#" B_PRIx64 " area %" B_PRId32 "\n", type,
+				base, size, areaID, range->base, range->size, range->area);
+			continue;
+		}
+
+		(KDEBUG ? panic : dprintf)("incompatible overlapping memory %#" B_PRIx64
+			", %#" B_PRIx64 " type %" B_PRIx32 " area %" B_PRId32
+			" with existing %#" B_PRIx64 ", %#" B_PRIx64 " type %" B_PRIx32
+			" area %" B_PRId32 "\n", base, size, type, areaID, range->base,
+			range->size, range->type, range->area);
+		return B_BUSY;
+	}
 
 	memory_type_range* range = areaID >= 0 ? find_range(areaID) : NULL;
 	int32 oldRangeType = -1;
@@ -630,6 +657,45 @@ remove_memory_type_range(area_id areaID)
 }
 
 
+static const char *
+memory_type_to_string(uint32 type)
+{
+	switch (type) {
+		case B_MTR_UC:
+			return "uncacheable";
+		case B_MTR_WC:
+			return "write combining";
+		case B_MTR_WT:
+			return "write-through";
+		case B_MTR_WP:
+			return "write-protected";
+		case B_MTR_WB:
+			return "write-back";
+		default:
+			return "unknown";
+	}
+}
+
+
+static int
+dump_memory_type_ranges(int argc, char **argv)
+{
+	kprintf(
+		"start            end              size             area     type\n");
+
+	for (MemoryTypeRangeList::Iterator it = sMemoryTypeRanges.GetIterator();
+			memory_type_range* range = it.Next();) {
+
+		kprintf("%#16" B_PRIx64 " %#16" B_PRIx64 " %#16" B_PRIx64 " % 8"
+			B_PRId32 " %#" B_PRIx32 " %s\n", range->base,
+			range->base + range->size, range->size, range->area, range->type,
+			memory_type_to_string(range->type));
+	}
+
+	return 0;
+}
+
+
 //	#pragma mark -
 
 
@@ -660,6 +726,11 @@ arch_vm_init_post_area(kernel_args *args)
 		panic("arch_vm_init_post_area: unable to map dma region\n");
 		return B_NO_MEMORY;
 	}
+
+	add_debugger_command_etc("memory_type_ranges", &dump_memory_type_ranges,
+		"List all configured memory type ranges",
+		"\n"
+		"Lists all memory type ranges with their types and areas.\n", 0);
 
 #ifndef __x86_64__
 	return bios_init();
@@ -699,7 +770,7 @@ arch_vm_init_post_modules(kernel_args *args)
 	// set the physical memory ranges to write-back mode
 	for (uint32 i = 0; i < args->num_physical_memory_ranges; i++) {
 		add_memory_type_range(-1, args->physical_memory_range[i].start,
-			args->physical_memory_range[i].size, B_MTR_WB);
+			args->physical_memory_range[i].size, B_MTR_WB, NULL);
 	}
 
 	return B_OK;
@@ -758,7 +829,8 @@ arch_vm_unset_memory_type(struct VMArea *area)
 
 status_t
 arch_vm_set_memory_type(struct VMArea *area, phys_addr_t physicalBase,
-	uint32 type)
+	uint32 type, uint32 *effectiveType)
 {
-	return add_memory_type_range(area->id, physicalBase, area->Size(), type);
+	return add_memory_type_range(area->id, physicalBase, area->Size(), type,
+		effectiveType);
 }

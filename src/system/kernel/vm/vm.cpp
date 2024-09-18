@@ -272,7 +272,7 @@ static cache_info* sCacheInfoTable;
 
 // function declarations
 static void delete_area(VMAddressSpace* addressSpace, VMArea* area,
-	bool addressSpaceCleanup);
+	bool deletingAddressSpace, bool alreadyRemoved = false);
 static status_t vm_soft_fault(VMAddressSpace* addressSpace, addr_t address,
 	bool isWrite, bool isExecute, bool isUser, vm_page** wirePage);
 static status_t map_backing_store(VMAddressSpace* addressSpace,
@@ -1948,14 +1948,18 @@ vm_map_physical_memory(team_id team, const char* name, void** _address,
 	cache->Unlock();
 
 	if (status == B_OK) {
-		// set requested memory type -- use uncached, if not given
+		// Set requested memory type -- use uncached if not given but allow it
+		// to be overridden by ranges that may already exist
 		uint32 memoryType = addressSpec & B_MTR_MASK;
-		if (memoryType == 0)
+		bool weak = memoryType == 0;
+		if (weak)
 			memoryType = B_MTR_UC;
+
+		status = arch_vm_set_memory_type(area, physicalAddress, memoryType,
+			weak ? &memoryType : NULL);
 
 		area->SetMemoryType(memoryType);
 
-		status = arch_vm_set_memory_type(area, physicalAddress, memoryType);
 		if (status != B_OK)
 			delete_area(locker.AddressSpace(), area, false);
 	}
@@ -2569,14 +2573,16 @@ vm_clone_area(team_id team, const char* name, void** address,
 	\param area The area to be deleted.
 	\param deletingAddressSpace \c true, if the address space is in the process
 		of being deleted.
+	\param alreadyRemoved \c true, if the area was already removed from the global
+		areas map (and thus had its ID deallocated.)
 */
 static void
 delete_area(VMAddressSpace* addressSpace, VMArea* area,
-	bool deletingAddressSpace)
+	bool deletingAddressSpace, bool alreadyRemoved)
 {
 	ASSERT(!area->IsWired());
 
-	if (area->id >= 0)
+	if (area->id >= 0 && !alreadyRemoved)
 		VMAreas::Remove(area);
 
 	// At this point the area is removed from the global hash table, but
@@ -4003,17 +4009,15 @@ vm_delete_areas(struct VMAddressSpace* addressSpace, bool deletingAddressSpace)
 	VMAreas::WriteLock();
 	{
 		VMAddressSpace::AreaIterator it = addressSpace->GetAreaIterator();
-		while (VMArea* area = it.Next()) {
+		while (VMArea* area = it.Next())
 			VMAreas::Remove(area);
-			area->id = INT32_MIN;
-		}
 	}
 	VMAreas::WriteUnlock();
 
 	// delete all the areas in this address space
 	while (VMArea* area = addressSpace->FirstArea()) {
 		ASSERT(!area->IsWired());
-		delete_area(addressSpace, area, deletingAddressSpace);
+		delete_area(addressSpace, area, deletingAddressSpace, true);
 	}
 
 	addressSpace->WriteUnlock();
@@ -5345,7 +5349,7 @@ vm_set_area_memory_type(area_id id, phys_addr_t physicalBase, uint32 type)
 	map->Unlock();
 
 	// set the physical memory type
-	status_t error = arch_vm_set_memory_type(area, physicalBase, type);
+	status_t error = arch_vm_set_memory_type(area, physicalBase, type, NULL);
 	if (error != B_OK) {
 		// reset the memory type of the area and the mapped pages
 		map->Lock();
