@@ -333,6 +333,8 @@ VMSAv8TranslationMap::GetOrMakeTable(phys_addr_t ptPa, int level, int index,
 	uint64_t oldPte = atomic_get64((int64*) ptePtr);
 
 	int type = oldPte & kPteTypeMask;
+	ASSERT(type != kPteTypeL12Block);
+
 	if (type == kPteTypeL012Table) {
 		// This is table entry already, just return it
 		return oldPte & kPteAddrMask;
@@ -376,8 +378,8 @@ VMSAv8TranslationMap::FlushVAIfAccessed(uint64_t pte, addr_t va)
 		return false;
 
 	InterruptsSpinLocker locker(sAsidLock);
-	if (fIsKernel) {
-		// We can't flush by ASID for kernel space.
+	if ((pte & kAttrNG) == 0) {
+		// Flush from all address spaces
 		asm("dsb ishst"); // Ensure PTE write completed
 		asm("tlbi vaae1is, %0" ::"r"(((va >> 12) & kTLBIMask)));
 		asm("dsb ish");
@@ -508,22 +510,22 @@ VMSAv8TranslationMap::GetMemoryAttr(uint32 attributes, uint32 memoryType, bool i
 
 	uint8_t type = MAIR_NORMAL_WB;
 
-	switch (memoryType & B_MTR_MASK) {
-		case B_MTR_UC:
+	switch (memoryType & B_MEMORY_TYPE_MASK) {
+		case B_UNCACHED_MEMORY:
 			// TODO: This probably should be nGnRE for PCI
 			type = MAIR_DEVICE_nGnRnE;
 			break;
-		case B_MTR_WC:
+		case B_WRITE_COMBINING_MEMORY:
 			type = MAIR_NORMAL_NC;
 			break;
-		case B_MTR_WT:
+		case B_WRITE_THROUGH_MEMORY:
 			type = MAIR_NORMAL_WT;
 			break;
-		case B_MTR_WP:
+		case B_WRITE_PROTECTED_MEMORY:
 			type = MAIR_NORMAL_WT;
 			break;
 		default:
-		case B_MTR_WB:
+		case B_WRITE_BACK_MEMORY:
 			type = MAIR_NORMAL_WB;
 			break;
 	}
@@ -597,6 +599,7 @@ VMSAv8TranslationMap::Unmap(addr_t start, addr_t end)
 
 	ProcessRange(fPageTable, fInitialLevel, start, size, nullptr,
 		[=](uint64_t* ptePtr, uint64_t effectiveVa) {
+			ASSERT(effectiveVa <= end);
 			uint64_t oldPte = atomic_get_and_set64((int64_t*)ptePtr, 0);
 			FlushVAIfAccessed(oldPte, effectiveVa);
 		});
@@ -888,6 +891,8 @@ VMSAv8TranslationMap::Protect(addr_t start, addr_t end, uint32 attributes, uint3
 
 	ProcessRange(fPageTable, fInitialLevel, start, size, nullptr,
 		[=](uint64_t* ptePtr, uint64_t effectiveVa) {
+			ASSERT(effectiveVa <= end);
+
 			// We need to use an atomic compare-swap loop because we must
 			// need to clear somes bits while setting others.
 			while (true) {
